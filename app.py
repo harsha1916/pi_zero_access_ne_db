@@ -33,6 +33,7 @@ USER_DATA_FILE         = os.path.join(BASE_DIR, "users.json")
 BLOCKED_USERS_FILE     = os.path.join(BASE_DIR, "blocked_users.json")
 DAILY_STATS_FILE       = os.path.join(BASE_DIR, "daily_stats.json")
 CONFIG_FILE            = os.path.join(BASE_DIR, "config.json")
+FAILED_TX_CACHE_FILE   = os.path.join(BASE_DIR, "failed_transactions_cache.jsonl")
 
 # NEW: transaction directory (daily JSONL files)
 TX_DIR                 = os.path.join(BASE_DIR, "transactions")
@@ -231,6 +232,67 @@ def append_local_transaction(tx: dict):
     line = json.dumps(tx, separators=(",", ":"))  # compact
     with open(path, "a") as f:
         f.write(line + "\n")
+
+# =========================
+# Failed Transaction Cache (persistent storage)
+# =========================
+FAILED_TX_LOCK = threading.RLock()
+
+def append_failed_transaction(tx: dict):
+    """Append a failed transaction to persistent cache file."""
+    try:
+        with FAILED_TX_LOCK:
+            line = json.dumps(tx, separators=(",", ":"))
+            with open(FAILED_TX_CACHE_FILE, "a") as f:
+                f.write(line + "\n")
+        logging.info(f"Added to failed transaction cache: {tx.get('card')} - {tx.get('status')}")
+    except Exception as e:
+        logging.error(f"Failed to write to cache file: {e}")
+
+def load_failed_transactions():
+    """Load all failed transactions from cache file."""
+    failed_txs = []
+    try:
+        with FAILED_TX_LOCK:
+            if os.path.exists(FAILED_TX_CACHE_FILE):
+                with open(FAILED_TX_CACHE_FILE, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            try:
+                                failed_txs.append(json.loads(line))
+                            except json.JSONDecodeError as e:
+                                logging.error(f"Invalid JSON in cache file: {e}")
+                logging.info(f"Loaded {len(failed_txs)} failed transactions from cache")
+    except Exception as e:
+        logging.error(f"Failed to load cache file: {e}")
+    return failed_txs
+
+def clear_failed_transactions_cache():
+    """Clear the failed transactions cache file (after successful upload)."""
+    try:
+        with FAILED_TX_LOCK:
+            if os.path.exists(FAILED_TX_CACHE_FILE):
+                os.remove(FAILED_TX_CACHE_FILE)
+                logging.info("Cleared failed transactions cache")
+    except Exception as e:
+        logging.error(f"Failed to clear cache file: {e}")
+
+def update_failed_transactions_cache(remaining_txs):
+    """Update cache file with remaining failed transactions."""
+    try:
+        with FAILED_TX_LOCK:
+            # Write remaining transactions to a temp file
+            temp_file = f"{FAILED_TX_CACHE_FILE}.tmp"
+            with open(temp_file, "w") as f:
+                for tx in remaining_txs:
+                    line = json.dumps(tx, separators=(",", ":"))
+                    f.write(line + "\n")
+            # Replace original file
+            os.replace(temp_file, FAILED_TX_CACHE_FILE)
+            logging.info(f"Updated failed transactions cache: {len(remaining_txs)} remaining")
+    except Exception as e:
+        logging.error(f"Failed to update cache file: {e}")
 
 def get_tx_dir_size_bytes() -> int:
     total = 0
@@ -572,9 +634,10 @@ def handle_access(bits, value, reader_id):
 # Background workers
 # =========================
 def transaction_uploader():
-    """Upload to Firebase if available; otherwise local-only (already appended)."""
+    """Upload to Firebase if available; save to persistent cache if offline."""
     while True:
         tx = transaction_queue.get()
+        
         try:
             if db is not None and is_internet():
                 try:
@@ -587,11 +650,77 @@ def transaction_uploader():
                     db.collection("transactions").add(tx_with_metadata)
                     logging.info(f"Transaction uploaded to Firestore: {tx.get('card')} - {tx.get('status')}")
                 except Exception as e:
-                    # We already have local copy; just log
-                    logging.warning(f"Firebase upload failed: {e}")
-            # else: offline, nothing to do (local already stored)
+                    # Upload failed - save to persistent cache
+                    append_failed_transaction(tx)
+                    logging.warning(f"Firebase upload failed, saved to cache: {e}")
+            else:
+                # No internet or Firebase not initialized - save to persistent cache
+                append_failed_transaction(tx)
+                logging.info(f"Offline - transaction saved to cache: {tx.get('card')}")
+        except Exception as e:
+            logging.error(f"Transaction uploader error: {e}")
         finally:
             transaction_queue.task_done()
+
+def failed_transactions_processor():
+    """Background worker to process failed transactions cache when online.
+    Runs independently without blocking normal access operations."""
+    
+    # Initial delay before first check
+    time.sleep(60)  # Wait 1 minute after startup
+    
+    while True:
+        try:
+            # Check if we have internet and Firebase is available
+            if db is not None and is_internet():
+                # Load failed transactions from persistent cache
+                failed_txs = load_failed_transactions()
+                
+                if failed_txs:
+                    logging.info(f"Processing {len(failed_txs)} failed transactions from cache...")
+                    
+                    successfully_uploaded = []
+                    still_failing = []
+                    
+                    # Process each failed transaction
+                    for tx in failed_txs:
+                        try:
+                            # Prepare transaction with metadata
+                            tx_with_metadata = dict(tx)
+                            tx_with_metadata['created_at'] = SERVER_TIMESTAMP
+                            tx_with_metadata['entity_id'] = ENTITY_ID
+                            
+                            # Try to upload
+                            db.collection("transactions").add(tx_with_metadata)
+                            successfully_uploaded.append(tx)
+                            logging.info(f"✓ Uploaded cached transaction: {tx.get('card')} - {tx.get('status')}")
+                            
+                            # Small delay between uploads to avoid overwhelming the server
+                            time.sleep(0.5)
+                            
+                        except Exception as e:
+                            # Still failing, keep in cache
+                            still_failing.append(tx)
+                            logging.warning(f"✗ Failed to upload cached transaction: {e}")
+                    
+                    # Update cache file with only the still-failing transactions
+                    if still_failing:
+                        update_failed_transactions_cache(still_failing)
+                        logging.info(f"Cache updated: {len(successfully_uploaded)} uploaded, {len(still_failing)} remaining")
+                    else:
+                        # All successful, clear the cache
+                        clear_failed_transactions_cache()
+                        logging.info(f"✓ All {len(successfully_uploaded)} cached transactions uploaded successfully!")
+                
+                # Wait before next check (5 minutes when online)
+                time.sleep(300)
+            else:
+                # Offline or Firebase not available, wait longer before checking again (10 minutes)
+                time.sleep(600)
+                
+        except Exception as e:
+            logging.error(f"Failed transactions processor error: {e}")
+            time.sleep(300)  # Wait 5 minutes on error before retrying
 
 def housekeeping_worker():
     """Session cleanup + optional sync hook."""
@@ -1494,6 +1623,7 @@ def main():
 
     # Workers
     threading.Thread(target=transaction_uploader, daemon=True).start()
+    threading.Thread(target=failed_transactions_processor, daemon=True).start()
     threading.Thread(target=housekeeping_worker,   daemon=True).start()
     threading.Thread(target=tx_storage_monitor_worker, daemon=True).start()
 
