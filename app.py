@@ -25,7 +25,7 @@ except Exception:
 # Env & constants
 # =========================
 load_dotenv()
-BASE_DIR   = os.environ.get('BASE_DIR', '/home/pi/accessctl')
+BASE_DIR   = os.environ.get('BASE_DIR', '/home/maxpark')
 os.makedirs(BASE_DIR, exist_ok=True)
 
 # File paths
